@@ -1,0 +1,265 @@
+# coding=utf-8
+# Copyright 2022 EleutherAI and the HuggingFace Inc. team. All rights reserved.
+#
+# This code is based on EleutherAI's GPT-NeoX library and the GPT-NeoX
+# and OPT implementations in HuggingFace Transformers.
+# Portions of this code are adapted from:
+#   - https://github.com/EleutherAI/gpt-neox (Apache License 2.0)
+#   - https://github.com/huggingface/transformers (Apache License 2.0)
+#   - https://github.com/SafeAILab/EAGLE (Apache License 2.0)
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import json
+import os
+import warnings
+from typing import Dict, List, Optional, Tuple, Union
+
+import torch
+from transformers import ImageProcessingMixin, PreTrainedTokenizer
+
+from datasets import Dataset as HFDataset
+
+
+from .parse import GeneralParser
+from .template import TEMPLATE_REGISTRY, ChatTemplate
+
+# define a type called conversation
+Conversation = List[Dict[str, str]]
+
+
+# ==============================
+# This file is for preprocessing the data
+# ==============================
+
+
+# Copied from https://github.com/SafeAILab/EAGLE/blob/main/eagle/traineagle3/cnets.py
+def preprocess_conversations(
+    tokenizer: PreTrainedTokenizer,
+    conversations: Union[List[Conversation], List[str]],
+    chat_template: ChatTemplate,
+    max_length: int = 2048,
+    is_preformatted: bool = False,
+    train_only_last_turn: bool = False,
+    tools: Optional[List[List[Dict]]] = [[]],
+    **kwargs,
+) -> Dict[str, List[torch.Tensor]]:
+    """
+    Preprocess a batch of ShareGPT style conversations or pre-formatted text.
+
+    Args:
+        tokenizer: The tokenizer to use for tokenization.
+        conversations: A list of conversations (if is_preformatted=False) or
+                      a list of pre-formatted text strings (if is_preformatted=True).
+        chat_template: The chat template to use for formatting/identifying spans.
+        max_length: The maximum length of the tokenized input.
+        is_preformatted: Whether the input is already formatted text strings.
+        train_only_last_turn: If True, only the last assistant turn contributes to the loss.
+        tools: Optional list of tools information corresponding to each conversation, used for tool-use conversations.
+
+    Returns:
+        A dictionary containing:
+            - input_ids: List of tokenized input IDs.
+            - loss_mask: List of loss masks indicating which tokens should contribute to the loss.
+            - attention_mask: List of attention masks.
+    """
+    # prepare result
+    results = {"input_ids": [], "loss_mask": [], "attention_mask": []}
+    if chat_template.parser_type == "general":
+        parser = GeneralParser(tokenizer, chat_template)
+    else:
+        raise ValueError(f"Invalid parser type: {chat_template.parser_type}")
+    kwargs_list = [{} for _ in range(len(conversations))]
+    for key, value_list in kwargs.items():
+        for i, value in enumerate(value_list):
+            kwargs_list[i][key] = value
+    for source, tool, kwargs_item in zip(conversations, tools, kwargs_list):
+        if not source:
+            # if the source is None, skip it
+            continue
+        input_ids, loss_mask = parser.parse(
+            source,
+            max_length,
+            preformatted=is_preformatted,
+            train_only_last_turn=train_only_last_turn,
+            tool=tool,
+            **kwargs_item,
+        )
+        results["input_ids"].append(input_ids[None, :])
+        results["loss_mask"].append(loss_mask[None, :])
+        results["attention_mask"].append(torch.ones_like(loss_mask)[None, :])
+    return results
+
+
+def build_eagle3_dataset(
+    dataset: HFDataset,
+    tokenizer: PreTrainedTokenizer,
+    chat_template: Optional[str] = None,
+    max_length: Optional[int] = 2048,
+    shuffle_seed: Optional[int] = 42,
+    num_proc: Optional[int] = 8,
+    cache_dir: Optional[str] = None,
+    cache_key: Optional[str] = None,
+    is_vlm: Optional[bool] = False,
+    processor: Optional[ImageProcessingMixin] = None,
+    is_preformatted: Optional[bool] = False,
+    train_only_last_turn: Optional[bool] = False,
+) -> HFDataset:
+    """
+    build eagle3 dataset
+
+    Args:
+        dataset: HF dataset to process.
+        tokenizer: The tokenizer to use for tokenization.
+        chat_template: The chat template to use for formatting conversations.
+                        This includes the system prompt and user/assistant tokens
+                        required to delineate different parts of the conversation
+                        for loss mask generation.
+        max_length: The maximum length of the tokenized input.
+        shuffle_seed: The seed for shuffling the dataset.
+        num_proc: The number of processes to use for multiprocessing.
+        cache_dir: The directory to use for caching the processed dataset.
+        cache_key: The key to use for caching the processed dataset.
+        is_vlm: Whether the dataset is for VLM models.
+        processor: The image processor to use for processing images.
+        is_preformatted: Whether the dataset contains preformatted text of the conversation
+                        (e.g. includes system prompt, user and assistant start and end tokens)
+                        and doesn't need to have the chat template applied.
+                        Note that the chat_template still needs to be specified to determine
+                        the assistant spans for loss mask generation.
+                        If True, expects "text" column with ready-to-train text.
+                        If False, expects "conversations" column with ShareGPT format.
+        train_only_last_turn: If True, only the last assistant turn contributes to the loss.
+                             Useful for thinking models where history may not contain thoughts.
+
+    Returns:
+        The processed HF dataset.
+    """
+    if is_vlm:
+        assert processor is not None, "processor must be provided when is_vlm is True"
+
+    # Validate chat_template requirement
+    if chat_template is None:
+        raise ValueError("chat_template must be provided for all dataset types")
+
+    assert (
+        chat_template in TEMPLATE_REGISTRY.get_all_template_names()
+    ), f"Chat template {chat_template} not found in TEMPLATE_REGISTRY, you may need to register it first"
+
+    template: ChatTemplate = TEMPLATE_REGISTRY.get(chat_template)
+
+    dataset = dataset.shuffle(seed=shuffle_seed)
+    original_cols = dataset.column_names
+
+    def preprocess_function(examples):
+        # Handle different dataset formats
+        if is_preformatted:
+            # Handle pre-formatted text (should be in "text" column)
+            if "text" not in examples:
+                raise ValueError(
+                    f"Expected 'text' column for is_preformatted=True, but found columns: {list(examples.keys())}"
+                )
+            processed = preprocess_conversations(
+                tokenizer,
+                examples["text"],
+                template,
+                max_length,
+                is_preformatted=True,
+                train_only_last_turn=train_only_last_turn,
+            )
+        else:
+            # Handle ShareGPT conversations
+            if "conversations" not in examples:
+                raise ValueError(
+                    f"Expected 'conversations' column for is_preformatted=False, but found columns: {list(examples.keys())}"
+                )
+            conversations = examples.pop("conversations")
+            if "id" in examples:
+                examples.pop("id")
+            if "tools" in examples:
+                tools_raw = examples.pop("tools")
+                # Parse tools: handle JSON strings from safe_conversations_generator
+                tools = []
+                for tool_item in tools_raw:
+                    if isinstance(tool_item, (str, list)):
+                        try:
+                            tools.append(json.loads(tool_item))
+                        except json.JSONDecodeError:
+                            warnings.warn(
+                                f"Failed to parse tools JSON string: {tool_item[:100]}..."
+                            )
+                            tools.append([])
+                    elif isinstance(tool_item, list):
+                        tools.append(tool_item)
+                    elif tool_item is None:
+                        tools.append([])
+                    else:
+                        warnings.warn(
+                            f"Unexpected tools type: {type(tool_item)}, using empty list"
+                        )
+                        tools.append([])
+            else:
+                tools = [[] for _ in range(len(conversations))]
+            processed = preprocess_conversations(
+                tokenizer,
+                conversations,
+                template,
+                max_length,
+                is_preformatted=False,
+                train_only_last_turn=train_only_last_turn,
+                tools=tools,
+                **examples,
+            )
+
+        return processed
+
+    # Process dataset only once
+    if cache_dir and cache_key:
+        load_from_cache_file = True
+        os.makedirs(cache_dir, exist_ok=True)
+        cache_file_name = os.path.join(cache_dir, f"{cache_key}.pkl")
+        print(f"dataset is cached at {cache_file_name}")
+    elif cache_dir is None and cache_key is None:
+        load_from_cache_file = False
+        cache_file_name = None
+        print(f"dataset is not cached")
+    else:
+        warnings.warn(
+            f"cache_dir and cache_key must be provided together to make caching work"
+        )
+
+    # Disable tokenizers internal parallelism when using multiprocessing to avoid
+    # deadlocks caused by forked Rust threads (see huggingface/tokenizers#1391).
+    if num_proc is not None and num_proc > 1:
+        os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
+    # adjust batch size based on dataset type
+    if is_vlm:
+        batch_size = (
+            200  # reduce batch size for VLM datasets to avoid PyArrow offset overflow
+        )
+    else:
+        batch_size = 1000  # default for conversations
+    dataset = dataset.map(
+        preprocess_function,
+        batched=True,
+        num_proc=num_proc,
+        batch_size=batch_size,
+        remove_columns=original_cols,
+        # keep_in_memory=True,
+        load_from_cache_file=load_from_cache_file,
+        cache_file_name=cache_file_name,
+    )
+
+    dataset.set_format(type="torch")
+    return dataset
