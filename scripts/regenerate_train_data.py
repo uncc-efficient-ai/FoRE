@@ -231,10 +231,11 @@ def main():
     valid_server_addresses = []
     for server_address in args.server_address:
         dummy = dict(conversations=[{"role": "user", "content": "Hello, how are you?"}])
-        if call_sglang(args, server_address, dummy, max_tokens=1) is not None:
+        probe = call_sglang(args, server_address, dummy, max_tokens=1)
+        if probe["status"] == "success":
             valid_server_addresses.append(server_address)
         else:
-            print(f"Server {server_address} is not available")
+            print(f"Server {server_address} is not available: {probe['error']}")
     if not valid_server_addresses:
         raise ValueError("No server address is available")
     print(f"Using {len(valid_server_addresses)} servers: {valid_server_addresses}")
@@ -304,6 +305,8 @@ def main():
             f"Context length (untokenized words) over new samples: "
             f"min {context_token_min}, max {context_token_max}, avg {context_token_sum / success_samples:.1f}"
         )
+    if error_samples:
+        raise SystemExit(f"{error_samples} prompts failed (see {error_file_path}); rerun with --resume --retry-errors")
 
 
 if __name__ == "__main__":

@@ -5,9 +5,9 @@ Each step:
    first drafted position (t2), and one K-row drafter pass drafts a block per candidate, with
    that candidate placed at slot 1.
 2. Draft refinement: best-first search over the drafter's per-slot probabilities picks up to
-   `rows` replacements. Each additional draft copies a draft up to some slot, swaps in a
+   `r` replacements. Each additional draft copies a draft up to some slot, swaps in a
    replacement token there, and a second drafter pass regenerates the rest of the block.
-3. The target verifies all K + rows drafts as rows of one batch. The draft matching the
+3. The target verifies all K + r drafts as rows of one batch. The draft matching the
    target's greedy continuation longest is committed, followed by the target's own next token.
 
 The committed text is the target's greedy output, up to bf16 near-ties.
@@ -56,16 +56,16 @@ def _mtp_mask(prefix, lo, start):
 def _continuation_rows(block_ids, branches, siblings):
     rows = block_ids.expand(len(siblings), -1).clone()
     slots = []
-    for r, (k, i, token) in enumerate(siblings):
+    for j, (b, i, token) in enumerate(siblings):
         slot = i + 2  # extension slot 0 is block slot 2 (slot 0 is t1, slot 1 is t2)
-        rows[r, 1:slot] = branches[k, 1:slot]
-        rows[r, slot] = token
+        rows[j, 1:slot] = branches[b, 1:slot]
+        rows[j, slot] = token
         slots.append(slot)
     return rows, slots
 
 
 @torch.inference_mode()
-def generate(target, drafter, mtp, input_ids, max_new_tokens, stop_ids, k=8, rows=8):
+def generate(target, drafter, mtp, input_ids, max_new_tokens, stop_ids, k=8, r=8):
     """Return (generated token ids [1, n], tokens committed per step)."""
     embed = target.get_input_embeddings()
     lm_head = target.get_output_embeddings()
@@ -75,7 +75,7 @@ def generate(target, drafter, mtp, input_ids, max_new_tokens, stop_ids, k=8, row
     max_len = n_in + max_new_tokens
     output_ids = torch.full((1, max_len + block), drafter.mask_token_id, dtype=torch.long, device=device)
     position_ids = torch.arange(output_ids.shape[1], device=device).unsqueeze(0)
-    draft_cache = StaticRowsCache(rows=max(k, rows, 1), max_len=output_ids.shape[1])
+    draft_cache = StaticRowsCache(rows=max(k, r, 1), max_len=output_ids.shape[1])
     mtp_cache = StaticRowsCache(rows=1, max_len=output_ids.shape[1])
     mtp_done = 0
     verifier = HybridTreeVerifier(target)
@@ -139,16 +139,16 @@ def generate(target, drafter, mtp, input_ids, max_new_tokens, stop_ids, k=8, row
         branches[:, 2:] = branch_logits[:, 1:].argmax(dim=-1)
 
         verify_rows = branches
-        if rows:
+        if r:
             root_probs = torch.softmax(root_logits.float(), dim=-1)
             branch_probs = torch.softmax(branch_logits.float(), dim=-1)
             top_v, top_i = branch_probs[:, 1:].topk(SIBLINGS_PER_SLOT, dim=-1)
-            siblings = best_first_rows(root_probs[cands], top_v, top_i, budget_rows=k + rows)[:rows]
+            siblings = best_first_rows(root_probs[cands], top_v, top_i, budget_rows=k + r)[:r]
             if siblings:
                 cont, slots = _continuation_rows(block_ids, branches, siblings)
                 cont_noise = noise.expand(len(siblings), -1, -1).clone()
-                for r, slot in enumerate(slots):
-                    cont_noise[r, 1 : slot + 1] = embed(cont[r, 1 : slot + 1])
+                for j, slot in enumerate(slots):
+                    cont_noise[j, 1 : slot + 1] = embed(cont[j, 1 : slot + 1])
                 cont_logits = lm_head(
                     drafter(
                         noise_embedding=cont_noise,
@@ -157,8 +157,8 @@ def generate(target, drafter, mtp, input_ids, max_new_tokens, stop_ids, k=8, row
                         past_key_values=draft_cache,
                     )[:, -block + 1 :, :]
                 )
-                for r, slot in enumerate(slots):
-                    cont[r, slot + 1 :] = cont_logits[r, slot:].argmax(dim=-1)
+                for j, slot in enumerate(slots):
+                    cont[j, slot + 1 :] = cont_logits[j, slot:].argmax(dim=-1)
                 verify_rows = torch.cat([branches, cont], dim=0)
 
         n_rows = verify_rows.shape[0]

@@ -15,7 +15,7 @@ def main():
     ap.add_argument("--prompt", required=True)
     ap.add_argument("--k", type=int, default=8, help="K, the number of MTP-guided drafts")
     ap.add_argument(
-        "--rows", type=int, default=8,
+        "--r", type=int, default=8,
         help="R, the number of additional drafts from draft refinement (0 for early forking alone)",
     )
     ap.add_argument("--max-new-tokens", type=int, default=512)
@@ -33,7 +33,7 @@ def main():
     torch.cuda.synchronize()
     t0 = time.perf_counter()
     ids, steps = generate(
-        target, drafter, mtp, input_ids, args.max_new_tokens, [tokenizer.eos_token_id], k=args.k, rows=args.rows
+        target, drafter, mtp, input_ids, args.max_new_tokens, [tokenizer.eos_token_id], k=args.k, r=args.r
     )
     torch.cuda.synchronize()
     seconds = time.perf_counter() - t0

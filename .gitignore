@@ -1,3 +1,10 @@
 .venv/
 __pycache__/
 models/
+# scripts/train_drafter.sh outputs; data/ keeps only the tracked prompt-id files
+/data/*
+!/data/decontam-exclude-ids.txt
+!/data/holdout-ids-qwen3.5-*.txt
+/runs/
+/sglang-env/
+/tmp/
